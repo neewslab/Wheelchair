@@ -1,0 +1,85 @@
+import RPi.GPIO as GPIO
+import time
+
+def obstacle_check(TRIGGER, ECHO, sensor_type, direction):
+    # Returns the distance of the obstacle detected by the sensor
+    # If the value lies outside the reasonable distance threshold, it's treated as no obstacle detected
+
+    # set Trigger to HIGH
+    GPIO.output(TRIGGER, True)
+    # set Trigger after 0.01ms to LOW
+    time.sleep(0.00001)
+    GPIO.output(TRIGGER, False)
+    StartTime = time.time()
+    StopTime = time.time()
+    # save StartTime
+    while GPIO.input(ECHO) == 0:
+        StartTime = time.time()
+    # save time of arrival
+    while GPIO.input(ECHO) == 1:
+        StopTime = time.time()
+    TimeElapsed = StopTime - StartTime
+    # multiply with the sonic speed (343 m/s)
+    # and divide by 2, because there and back
+    distance = round((TimeElapsed * 343 / 2),3)
+    if sensor_type == "front":
+        if distance > 1.75 or distance < .06:
+            print(sensor_type, direction, "sensor: No obstacle")
+            return 0
+    elif sensor_type == "diagonal":
+        if distance > 1.25 or distance < .06:
+            print(sensor_type, direction, "sensor: No obstacle")
+            return 0
+    else:
+        if distance > 0.6 or distance < .06:
+            print(sensor_type, direction, "sensor: No obstacle")
+            return 0
+    print(sensor_type, direction, "sensor:", distance, "m")
+    return 0
+
+# Connect to ultrasonic sensor communication
+GPIO.setmode(GPIO.BCM)
+FLT = 27
+FLR = 22
+GPIO.setup(FLT, GPIO.OUT)
+GPIO.setup(FLR, GPIO.IN)
+FRT = 23
+FRR = 24
+GPIO.setup(FRT, GPIO.OUT)
+GPIO.setup(FRR, GPIO.IN)
+DLT = 8
+DLR = 7
+GPIO.setup(DLT, GPIO.OUT)
+GPIO.setup(DLR, GPIO.IN)
+DRT = 10
+DRR = 9
+GPIO.setup(DRT, GPIO.OUT)
+GPIO.setup(DRR, GPIO.IN)
+SLT = 6
+SLR = 26
+GPIO.setup(SLT, GPIO.OUT)
+GPIO.setup(SLR, GPIO.IN)
+SRT = 25
+SRR = 5
+GPIO.setup(SRT, GPIO.OUT)
+GPIO.setup(SRR, GPIO.IN)
+
+try:
+    while True:
+        obstacle_check(SLT,SLR,"side","left")
+        time.sleep(2)
+        obstacle_check(DLT,DLR,"diagonal","left")
+        time.sleep(2)
+        obstacle_check(FLT,FLR,"front","left")
+        time.sleep(2)
+        obstacle_check(FRT,FRR,"front","right")
+        time.sleep(2)
+        obstacle_check(DRT,DRR,"diagonal","right")
+        time.sleep(2)
+        obstacle_check(SRT,SRR,"side","right")
+        time.sleep(2)
+except KeyboardInterrupt:
+    print("Measurement stopped by user.")
+    
+GPIO.cleanup()
+    

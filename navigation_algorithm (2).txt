@@ -1,0 +1,458 @@
+import numpy
+import math
+import serial
+import time
+import RPi.GPIO as GPIO
+
+
+def connect_to_ports():
+    # Connects to GPIOs for ultrasonic sensors and serial IO pins for wheelchair motors
+    # Also connects to listener
+
+    # Connect to motor communication
+    MOTOR = serial.Serial(port="/dev/ttyAMA0", baudrate=83333, parity=serial.PARITY_EVEN, timeout=1)
+    print("Connected to " + MOTOR.name)
+    # Connect to ultrasonic sensor communication
+    GPIO.setmode(GPIO.BCM)
+    FLT = 27
+    FLR = 22
+    GPIO.setup(FLT, GPIO.OUT)
+    GPIO.setup(FLR, GPIO.IN)
+    FRT = 23
+    FRR = 24
+    GPIO.setup(FRT, GPIO.OUT)
+    GPIO.setup(FRR, GPIO.IN)
+    DLT = 8
+    DLR = 7
+    GPIO.setup(DLT, GPIO.OUT)
+    GPIO.setup(DLR, GPIO.IN)
+    DRT = 10
+    DRR = 9
+    GPIO.setup(DRT, GPIO.OUT)
+    GPIO.setup(DRR, GPIO.IN)
+    SLT = 6
+    SLR = 26
+    GPIO.setup(SLT, GPIO.OUT)
+    GPIO.setup(SLR, GPIO.IN)
+    SRT = 25
+    SRR = 5
+    GPIO.setup(SRT, GPIO.OUT)
+    GPIO.setup(SRR, GPIO.IN)
+    # Connect to listener communication
+    LISTENER = serial.Serial(port="/dev/ttyACM0", baudrate=115200)
+    print("Connected to " + LISTENER.name)
+    LISTENER.write("\r\r".encode())
+    time.sleep(1)
+    LISTENER.write("lep\r".encode())
+    time.sleep(1)
+    for i in range(10):
+        LISTENER.readline()
+    return MOTOR, LISTENER, FLT, FLR, FRT, FRR, DLT, DLR, DRT, DRR, SLT, SLR, SRT, SRR
+
+
+def get_data():
+    # Returns averaged location data from both tags, if possible
+    # Otherwise, returns location data from one tag
+    line = LISTENER.readline()
+    tag1 = str(line.rstrip())
+    tag1 = tag1.split(',')
+    tag1_error = False
+    line2 = LISTENER.readline()
+    tag2 = str(line2.rstrip())
+    tag2 = tag2.split(',')
+    tag2_error = False
+    try:
+        if tag1[0] != "b'POS" or tag1[3] == 'nan':
+            tag1_error = True
+        if tag2[0] != "b'POS" or tag2[3] == 'nan':
+            tag2_error = True
+        if tag1_error and tag2_error:
+            raise IndexError
+        elif tag1_error and not tag2_error:
+            raw_x = round(float(tag2[3]), 4)
+            raw_y = round(float(tag2[4]), 4)
+        elif not tag1_error and tag2_error:
+            raw_x = round(float(tag1[3]), 4)
+            raw_y = round(float(tag1[4]), 4)
+        else:
+            raw_x = round((float(tag1[3]) + float(tag2[3])) / 2, 4)
+            raw_y = round((float(tag1[4]) + float(tag2[4])) / 2, 4)
+
+        return raw_x,raw_y
+
+    except IndexError:
+        print("Unable to read location. Trying again.")
+        return get_data()
+
+
+def check_input():
+    # Clears all location data in the input buffer
+    if LISTENER.in_waiting > 0:
+        LISTENER.read(LISTENER.in_waiting)
+
+
+def get_angle(current_x, current_y, dest_x, dest_y):
+    # Calculates the angle between two points
+
+    if dest_x - current_x == 0:
+        if dest_y - current_y > 0:
+            return 90
+        else:
+            return 270
+    else:
+        angle = math.atan((dest_y - current_y) / (dest_x - current_x))
+        angle = math.degrees(angle)
+        if (dest_x - current_x) < 0:
+            angle = angle + 180
+        if (dest_x - current_x) > 0 and (dest_y - current_y) < 0:
+            angle = angle + 360
+        return round(angle)
+
+
+def angle_difference(target, heading):
+    # Returns the difference between two angles (ranges from -180 to +180 for left/right turn purposes)
+    difference = target - heading
+    if difference > 180:
+        difference = (360 - difference) * -1
+    if difference < -180:
+        difference = (-360 - difference) * -1
+    return int(difference)
+
+
+def avg_location():
+    # Returns the averaged location data over a period of time
+    averages = 10
+    total_x = 0.0
+    total_y = 0.0
+    for i in range(averages):
+        x,y = get_data()
+        total_x = total_x + x
+        total_y = total_y + y
+    avg_x = total_x / averages
+    avg_y = total_y / averages
+    return avg_x, avg_y
+
+
+def move(length, x, y, speed=11):
+    # Sends movement signals to the wheelchair
+    address = 241
+    checksum = (x + y + speed) % 256
+    for i in range(length):
+        MOTOR.write(address.to_bytes(1, 'little'))
+        MOTOR.write(x.to_bytes(1, 'little'))
+        MOTOR.write(y.to_bytes(1, 'little'))
+        MOTOR.write(speed.to_bytes(1, 'little'))
+        MOTOR.write(checksum.to_bytes(1, 'little'))
+    check_input()
+
+
+def adjust_move(heading_list, dest_x, dest_y, near=False):
+    # Calculates current heading of the moving wheelchair, adjusts if necessary
+    heading = get_angle(heading_list[0][0],heading_list[0][1],heading_list[1][0],heading_list[1][1])
+    target = get_angle(heading_list[0][0],heading_list[0][1], dest_x, dest_y)
+    diff = angle_difference(target, heading)
+    if near:
+        pass
+    else:
+        speed = 190
+        turn_size = 100
+        if math.fabs(diff) >= 15:
+            print("Adjusting", math.fabs(diff), "degrees.")
+            if diff < 0:
+                move(int(-25 * diff), 128 + turn_size, speed)
+            else:
+                move(int(25 * diff), 128 - turn_size, speed)
+
+    return heading
+
+
+def initial_heading(destination):
+    # this function determines the chair's initial heading and adjusts heading to align with the destination
+
+    print("Determining heading...")
+    print("Getting initial position...")
+    old_location = avg_location()
+    old_x = old_location[0]
+    old_y = old_location[1]
+
+    print("Move forward slightly")
+    move(5500, 128, 255)
+    for i in range(4):
+        LISTENER.readline()
+
+    print("Getting new position...")
+    new_location = avg_location()
+    new_x = new_location[0]
+    new_y = new_location[1]
+
+    heading_angle = get_angle(old_x, old_y, new_x, new_y)
+    target_angle = get_angle(new_x, new_y, destination[0], destination[1])
+    x0, y0 = heading_alignment(heading_angle, target_angle)
+    distance = math.sqrt(math.pow((destination[0] - x0), 2) +
+                         math.pow((destination[1] - y0), 2))
+    return distance, x0, y0
+
+
+def heading_alignment(heading, target):
+    # Performs heading alignment for a stationary wheelchair
+    # Different than adjust_move because a stationary chair requires more time to turn
+
+    print("Target:", target, "| Heading:", heading)
+    angle_of_rotation = angle_difference(target, heading)
+    if angle_of_rotation < 0:
+        angle_of_rotation = angle_of_rotation * (-1)
+        if angle_of_rotation >= 15:
+            print("Turning", angle_of_rotation, "degrees right.")
+            move(math.floor(500 + 85.7 * angle_of_rotation - .174 * math.pow(angle_of_rotation, 2)), 255, 128)
+    else:
+        if angle_of_rotation >= 15:
+            print("Turning", angle_of_rotation, "degrees left.")
+            move(math.floor(500 + 85.7 * angle_of_rotation - .174 * math.pow(angle_of_rotation, 2)), 0, 128)
+    for i in range(4):
+        LISTENER.readline()
+
+    return get_data()
+
+
+def initialize_kalman(x, y):
+    # Initializes the values and matrices of the Kalman filter for navigation
+
+    delta_t = 0.5
+    a_sd = 0.05
+    measurement_sd = 0.10
+    F = numpy.array([[1, delta_t, 0.5 * math.pow(delta_t, 2), 0, 0, 0],
+                     [0, 1, delta_t, 0, 0, 0],
+                     [0, 0, 1, 0, 0, 0],
+                     [0, 0, 0, 1, delta_t, 0.5 * math.pow(delta_t, 2)],
+                     [0, 0, 0, 0, 1, delta_t],
+                     [0, 0, 0, 0, 0, 1]])
+
+    Q = a_sd * numpy.array(
+        [[0.25 * math.pow(delta_t, 4), 0.5 * math.pow(delta_t, 3), 0.5 * math.pow(delta_t, 2), 0, 0, 0],
+         [0.5 * math.pow(delta_t, 3), math.pow(delta_t, 2), delta_t, 0, 0, 0],
+         [0.5 * math.pow(delta_t, 2), delta_t, 1, 0, 0, 0],
+         [0, 0, 0, 0.25 * math.pow(delta_t, 4), 0.5 * math.pow(delta_t, 3), 0.5 * math.pow(delta_t, 2)],
+         [0, 0, 0, 0.5 * math.pow(delta_t, 3), math.pow(delta_t, 2), delta_t],
+         [0, 0, 0, 0.5 * math.pow(delta_t, 2), delta_t, 1]])
+
+    H = numpy.array([[1, 0, 0, 0, 0, 0],
+                     [0, 0, 0, 1, 0, 0]])
+
+    R = numpy.array([[math.pow(measurement_sd, 2), 0],
+                     [0, math.pow(measurement_sd, 2)]])
+
+    x0 = numpy.array([x, 0.3, 0.3, y, 0.3, 0.3]).reshape(6, 1)
+    uncertainty = 0.5
+    P0 = numpy.array([[uncertainty, 0, 0, 0, 0, 0],
+                      [0, uncertainty, 0, 0, 0, 0],
+                      [0, 0, uncertainty, 0, 0, 0],
+                      [0, 0, 0, uncertainty, 0, 0],
+                      [0, 0, 0, 0, uncertainty, 0],
+                      [0, 0, 0, 0, 0, uncertainty]])
+    # Initialization step
+    x = numpy.matmul(F, x0)
+    P = numpy.matmul(numpy.matmul(F, P0), F.T) + Q
+
+    return F, Q, H, R, x, P
+
+
+def kalman_correction(raw_x, raw_y, F, Q, H, R, x, P):
+    # Performs the predict and update steps of Kalman filtering on measured location data
+
+    I = numpy.identity(6)
+    # Measure
+    z = numpy.array([raw_x, raw_y]).reshape(2, 1)
+    # Update
+    K = numpy.matmul(numpy.matmul(P, H.T),
+                     numpy.linalg.inv(numpy.matmul(numpy.matmul(H, P), H.T) + R))
+    # Outlier detection
+    if (math.fabs(raw_x - x[0]) > 0.8) or (math.fabs(raw_y - x[3] > 0.8)):
+        print("OUTLIER DETECTED")
+        gain_reduction = 0.25
+        K *= gain_reduction
+
+    x = x + numpy.matmul(K, (z - numpy.matmul(H, x)))
+    corrected_x = round(float(x[0]), 3)
+    corrected_y = round(float(x[3]), 3)
+    p_term = I - numpy.matmul(K, H)
+    P = numpy.matmul(numpy.matmul(p_term, P), p_term.T) + numpy.matmul(numpy.matmul(K, R), K.T)
+    # Predict
+    x = numpy.matmul(F, x)
+    P = numpy.matmul(numpy.matmul(F, P), F.T) + Q
+    return corrected_x, corrected_y, F, Q, H, R, x, P
+
+
+def obstacle_check(TRIGGER, ECHO, sensor_type):
+    # Returns the distance of the obstacle detected by the sensor
+    # If the value lies outside the reasonable distance threshold, it's treated as no obstacle detected
+
+    # set Trigger to HIGH
+    GPIO.output(TRIGGER, True)
+    # set Trigger after 0.01ms to LOW
+    time.sleep(0.00001)
+    GPIO.output(TRIGGER, False)
+    StartTime = time.time()
+    StopTime = time.time()
+    # save StartTime
+    while GPIO.input(ECHO) == 0:
+        StartTime = time.time()
+    # save time of arrival
+    while GPIO.input(ECHO) == 1:
+        StopTime = time.time()
+    TimeElapsed = StopTime - StartTime
+    # multiply with the sonic speed (343 m/s)
+    # and divide by 2, because there and back
+    distance = round((TimeElapsed * 343 / 2),3)
+    if sensor_type == "front":
+        if distance > 1.3 or distance < .10:
+            return 999
+    elif sensor_type == "diagonal":
+        if distance > 1 or distance < .10:
+            return 999
+    else:
+        if distance > 0.6 or distance < .10:
+            return 999
+    return distance
+
+
+def closest_obstacle(LT,LR,RT,RR,sensor_type):
+    # For now, returns the distance and direction of the closest obstacle for each sensor type (front, diagonal, side)
+    # More advanced policies should be implemented to manage instances of similar distances on both sides
+
+    L = obstacle_check(LT, LR, sensor_type)
+    R = obstacle_check(RT, RR, sensor_type)
+    if L != 999 and R != 999:
+        if L < R:
+            return True, L, "left"
+        else:
+            return True, R, "right"
+    elif L != 999:
+        return True, L, "left"
+    elif R != 999:
+        return True, R, "right"
+    else:
+        return False, 999, ""
+
+
+def avoid_obstacle(dist,direction,sensor_type):
+    # Performs an avoidance maneuver based on the distance and direction of the obstacle
+
+    if sensor_type == "front":
+        speed = 195
+        if dist > 1.25:
+            turn_size = 50
+        elif dist > 0.75:
+            turn_size = 65
+        else:
+            turn_size = 90
+    elif sensor_type == "diagonal":
+        speed = 190
+        turn_size = 65
+    else:
+        speed = 195
+        turn_size = 50
+
+    print("Avoiding", sensor_type, direction, "obstacle at", dist, "m")
+    if direction == "left":
+        move(500, 128 + turn_size, speed)
+    else:
+        move(500, 128 - turn_size, speed)
+
+
+##############################
+#           MAIN             #
+##############################
+MOTOR, LISTENER, FLT, FLR, FRT, FRR, DLT, DLR, DRT, DRR, SLT, SLR, SRT, SRR = connect_to_ports()
+#destination = [(4,1.8),(2.4,5.2)]
+#destination = [(4,1.8),(4.9,5.2),(2.4,5.2)]
+destination = [(5.4,1.8),(2.4,5.2)]
+distance, x0, y0 = initial_heading(destination[0])
+try:
+    for p in range(len(destination)):
+        count = 0
+        dest_x = destination[p][0]
+        dest_y = destination[p][1]
+        if p != 0:
+            # for each destination point after the first, heading is aligned
+            # toward the next point
+            target = get_angle(old_x, old_y, dest_x, dest_y)
+            x0, y0 = heading_alignment(heading, target)
+            old_x = x0
+            old_y = y0
+            distance = math.sqrt(math.pow((dest_x - x0), 2) + math.pow((dest_y - y0), 2))
+
+        F, Q, H, R, x, P = initialize_kalman(x0, y0)
+        heading_list = []
+        while distance > 0.5:
+            obstacle_encountered = False
+            front_flag, ob_front, ob_front_direction = closest_obstacle(FLT, FLR, FRT, FRR, "front")
+            diagonal_flag, ob_diagonal, ob_diagonal_direction = closest_obstacle(DLT, DLR, DRT, DRR, "diagonal")
+            side_flag, ob_side, ob_side_direction = closest_obstacle(SLT, SLR, SRT, SRR, "side")
+            while front_flag or diagonal_flag or side_flag:
+                obstacle_encountered = True
+                raw_x, raw_y = get_data()
+                new_x, new_y, F, Q, H, R, x, P = kalman_correction(raw_x, raw_y, F, Q, H, R, x, P)
+                distance = math.sqrt(math.pow((dest_x - new_x), 2) + math.pow((dest_y - new_y), 2))
+                if distance < 1:
+                    break
+                if front_flag:
+                    if ob_front > distance:
+                        break
+                    avoid_obstacle(ob_front,ob_front_direction,"front")
+                if diagonal_flag:
+                    if ob_diagonal > distance:
+                        break
+                    avoid_obstacle(ob_diagonal,ob_diagonal_direction,"diagonal")
+                if side_flag:
+                    if ob_side > distance:
+                        break
+                    avoid_obstacle(ob_side,ob_side_direction,"side")
+
+                front_flag, ob_front, ob_front_direction = closest_obstacle(FLT, FLR, FRT, FRR, "front")
+                diagonal_flag, ob_diagonal, ob_diagonal_direction = closest_obstacle(DLT, DLR, DRT, DRR, "diagonal")
+                side_flag, ob_side, ob_side_direction = closest_obstacle(SLT, SLR, SRT, SRR, "side")
+                heading_list.append((new_x, new_y))
+                if len(heading_list) == 2:
+                    heading_list.pop(0)
+                    
+                count = 0
+
+            if not obstacle_encountered:
+                raw_x, raw_y = get_data()
+                new_x, new_y, F, Q, H, R, x, P = kalman_correction(raw_x, raw_y, F, Q, H, R, x, P)
+                distance = math.sqrt(math.pow((dest_x - new_x), 2) + math.pow((dest_y - new_y), 2))
+
+            if len(heading_list) < 2 and count > 1 and count % 2 == 0:
+                heading_list.append((new_x, new_y))
+
+            print("Distance remaining: ", round(distance, 2))
+            if distance < 1.0:
+                near = True
+                move(500, 128, 175)
+            else:
+                near = False
+                move(500, 128, 200)
+
+            # Checks for adjustments
+            if len(heading_list) == 2:
+                heading = adjust_move(heading_list, dest_x, dest_y, near)
+                heading_list.pop(0)
+
+            old_x = new_x
+            old_y = new_y
+
+            count += 1
+        print("Destination", p+1, "reached.")
+        # wait 3 seconds after destination reached
+        for i in range(12):
+            LISTENER.readline()
+
+except KeyboardInterrupt:
+    print("Navigation stopped by user")
+
+print("Final destination reached.")
+LISTENER.write("\r".encode())
+LISTENER.close()
+GPIO.cleanup()
+
+
